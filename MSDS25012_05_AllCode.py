@@ -2,6 +2,7 @@
 
 
 import argparse
+import copy
 import os
 import random
 import warnings
@@ -36,7 +37,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
 
-# 1. Data Loader Class
+# 1. Data Loader Class 
 
 class DiffusionDataset(Dataset):
     """
@@ -45,7 +46,7 @@ class DiffusionDataset(Dataset):
     during the forward diffusion process.
     """
 
-    def __init__(self, data_path, image_size=64, num_images_per_class=20,
+    def __init__(self, data_path, image_size=64, num_images_per_class=120,
                  classes=None, transform=None):
         self.data_path = data_path
         self.image_size = image_size
@@ -100,7 +101,7 @@ class DiffusionDataset(Dataset):
             return self.__getitem__(random.randint(0, len(self) - 1))
 
 
-# 2. Forward Diffusion Process 
+# 2. Forward Diffusion Process  
 
 class DiffusionForwardProcess:
     """
@@ -146,7 +147,7 @@ class DiffusionForwardProcess:
         return noisy_images
 
 
-# 3. Model Architecture 
+# 3. Model Architecture  
 
 class SinusoidalPositionEmbedding(nn.Module):
     """
@@ -206,13 +207,13 @@ class UNet(nn.Module):
     Skip connections preserve spatial detail lost during downsampling.
 
     Activation choices:
-      SiLU throughout hidden layers  (smooth, non-zero gradient everywhere)
-      No activation on final output  (noise prediction is unbounded)
+      - SiLU throughout hidden layers  (smooth, non-zero gradient everywhere)
+      - No activation on final output  (noise prediction is unbounded)
     Normalisation:
-      GroupNorm (groups=8) instead of BatchNorm because batch sizes are tiny.
+      - GroupNorm (groups=8) instead of BatchNorm because batch sizes are tiny.
     """
 
-    def __init__(self, in_channels=3, out_channels=3, base_channels=64,
+    def __init__(self, in_channels=3, out_channels=3, base_channels=32,
                  time_emb_dim=256, num_res_blocks=2, channel_mults=(1, 2, 4)):
         super().__init__()
         self.time_emb_dim = time_emb_dim
@@ -249,7 +250,7 @@ class UNet(nn.Module):
             else:
                 self.downsamplers.append(nn.Identity())
 
-        #  Bottleneck
+        #  Bottleneck 
         self.bottleneck1 = ResidualBlock(ch, ch, time_emb_dim)
         self.bottleneck2 = ResidualBlock(ch, ch, time_emb_dim)
 
@@ -287,7 +288,7 @@ class UNet(nn.Module):
         t_emb = self.time_mlp(self.time_embedding(t))
         h = self.init_conv(x)
 
-        # Encoder: store one skip per level
+        # Encoder — store one skip per level
         skips = []
         for level_blocks, downsampler in zip(self.encoder_levels, self.downsamplers):
             for block in level_blocks:
@@ -310,7 +311,7 @@ class UNet(nn.Module):
         return self.final_conv(h)
 
 
-# 4. Custom Loss Function 
+# 4. Custom Loss Function  
 
 def custom_diffusion_loss(noise_pred, noise_true):
     """
@@ -322,6 +323,15 @@ def custom_diffusion_loss(noise_pred, noise_true):
     l1 = torch.mean(torch.abs(noise_pred - noise_true))
     l2 = torch.mean((noise_pred - noise_true) ** 2)
     return l1 + l2
+
+
+# EMA Helper
+
+def update_ema(ema_model, model, decay=0.995):
+    """Exponential Moving Average update — stabilises generation quality."""
+    with torch.no_grad():
+        for ema_p, p in zip(ema_model.parameters(), model.parameters()):
+            ema_p.mul_(decay).add_(p, alpha=1 - decay)
 
 
 # Diffusion Model (forward + reverse combined)
@@ -372,14 +382,18 @@ class DiffusionModel:
 
 # Training Function
 
-def train_diffusion_model(model, diffusion, train_loader, epochs=100, lr=1e-4,
-                          device='cpu', save_path='models/', print_every=10):
+def train_diffusion_model(model, ema_model, diffusion, train_loader,
+                          epochs=600, lr=1e-4, device='cpu',
+                          save_path='models/', print_every=10,
+                          patience=40, min_delta=1e-4):
+
     optimizer = optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999))
     scheduler = StepLR(optimizer, step_size=30, gamma=0.5)
     os.makedirs(save_path, exist_ok=True)
 
-    losses    = []
+    losses = []
     best_loss = float('inf')
+    epochs_without_improvement = 0
     print(f"Starting training for {epochs} epochs on {device}")
 
     for epoch in range(epochs):
@@ -390,9 +404,9 @@ def train_diffusion_model(model, diffusion, train_loader, epochs=100, lr=1e-4,
             images     = images.to(device)
             batch_size = images.size(0)
 
-            t                  = torch.randint(0, diffusion.T, (batch_size,), device=device)
-            x_t, noise_true    = diffusion.forward_process.add_noise(images, t)
-            noise_pred         = diffusion.predict_noise(x_t, t)
+            t               = torch.randint(0, diffusion.T, (batch_size,), device=device)
+            x_t, noise_true = diffusion.forward_process.add_noise(images, t)
+            noise_pred      = diffusion.predict_noise(x_t, t)
 
             loss = custom_diffusion_loss(noise_pred, noise_true)
 
@@ -400,6 +414,9 @@ def train_diffusion_model(model, diffusion, train_loader, epochs=100, lr=1e-4,
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+
+            # Update EMA after every batch
+            update_ema(ema_model, model)
 
             epoch_loss  += loss.item()
             batch_count += 1
@@ -411,32 +428,45 @@ def train_diffusion_model(model, diffusion, train_loader, epochs=100, lr=1e-4,
         losses.append(avg_loss)
         scheduler.step()
 
-        # Save best model
-        if avg_loss < best_loss:
+        # Early stopping + save best model
+        if avg_loss < best_loss - min_delta:
             best_loss = avg_loss
+            epochs_without_improvement = 0
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
+                'ema_model_state_dict': ema_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss
             }, os.path.join(save_path, 'best_model.pth'))
+        else:
+            epochs_without_improvement += 1
 
         # Checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
+                'ema_model_state_dict': ema_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss
             }, os.path.join(save_path, f'checkpoint_epoch_{epoch+1}.pth'))
 
-        print(f"Epoch {epoch+1}/{epochs} | Avg Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+        print(f"Epoch {epoch+1}/{epochs} | Avg Loss: {avg_loss:.4f} | "
+              f"LR: {scheduler.get_last_lr()[0]:.6f} | "
+              f"No improve: {epochs_without_improvement}/{patience}")
 
         # Visualise samples every 20 epochs
         if (epoch + 1) % 20 == 0:
             with torch.no_grad():
                 samples, _ = diffusion.sample(4, show_progress=False)
                 visualize_samples(samples, epoch, save_path)
+
+        # Early stopping check
+        if epochs_without_improvement >= patience:
+            print(f"\nEarly stopping triggered at epoch {epoch+1} — "
+                  f"no improvement for {patience} epochs.")
+            break
 
     return losses
 
@@ -446,7 +476,9 @@ def train_diffusion_model(model, diffusion, train_loader, epochs=100, lr=1e-4,
 def visualize_samples(images, epoch=None, save_path='models/'):
     if isinstance(images, torch.Tensor):
         images = images.cpu()
-        images = (images + 1) / 2
+        # Min-max normalize for visibility
+        images = images - images.min()
+        images = images / (images.max() + 1e-8)
         images = torch.clamp(images, 0, 1).permute(0, 2, 3, 1).numpy()
     fig, axes = plt.subplots(1, min(4, len(images)), figsize=(12, 3))
     if len(images) == 1:
@@ -496,33 +528,35 @@ def plot_loss_graph(losses, save_path='models/'):
     plt.close()
 
 
-# 5. Test Function 
+# 5. Test Function  (10 marks)
 
-def test_model(model_path, diffusion, device, num_samples=4):
-    """Load trained model and generate images from pure Gaussian noise."""
+def test_model(model_path, diffusion, device, num_samples=4, save_path='models/'):
+    """Load trained EMA model and generate images from pure Gaussian noise."""
     print(f"Loading model from: {model_path}")
     checkpoint = torch.load(model_path, map_location=device)
-    diffusion.model.load_state_dict(checkpoint['model_state_dict'])
+    diffusion.model.load_state_dict(checkpoint['ema_model_state_dict'])
     diffusion.model.eval()
     print(f"Loaded epoch {checkpoint['epoch']+1}, loss {checkpoint['loss']:.4f}")
 
     with torch.no_grad():
         samples, sample_steps = diffusion.sample(num_samples, show_progress=True)
-        visualize_samples(samples, save_path='models/')
+        visualize_samples(samples, save_path=save_path)
 
         if sample_steps:
             fig, axes = plt.subplots(len(sample_steps), num_samples,
                                      figsize=(num_samples * 3, len(sample_steps) * 3))
             for i, s in enumerate(sample_steps):
                 for j in range(min(num_samples, s.size(0))):
-                    img = torch.clamp((s[j].cpu() + 1) / 2, 0, 1).permute(1, 2, 0).numpy()
-                    axes[i, j].imshow(img)
+                    img = s[j].cpu().float()
+                    img = img - img.min()
+                    img = img / (img.max() + 1e-8)
+                    axes[i, j].imshow(img.permute(1, 2, 0).numpy())
                     axes[i, j].axis('off')
                     if j == 0:
                         axes[i, j].set_ylabel(f't={diffusion.T - i*100 - 1}', fontsize=10)
             plt.suptitle('Reverse Diffusion (Noise -> Image)', fontsize=14)
             plt.tight_layout()
-            plt.savefig('models/sampling_process.png', dpi=150, bbox_inches='tight')
+            plt.savefig(os.path.join(save_path, 'sampling_process.png'), dpi=150, bbox_inches='tight')
             plt.show()
             plt.close()
 
@@ -533,14 +567,14 @@ def test_model(model_path, diffusion, device, num_samples=4):
 
 def main():
     parser = argparse.ArgumentParser(description='DDPM Training - MSDS25012')
-    parser.add_argument('--data_path',  type=str, default='data/',   help='Path to animal dataset')
-    parser.add_argument('--save_path',  type=str, default='models/', help='Where to save models/plots')
-    parser.add_argument('--epochs',     type=int, default=100)
-    parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--lr',         type=float, default=1e-4)
-    parser.add_argument('--image_size', type=int, default=64)
-    parser.add_argument('--T',          type=int, default=1000)
-    parser.add_argument('--images_per_class', type=int, default=20)
+    parser.add_argument('--data_path',        type=str,   default='data/',   help='Path to animal dataset')
+    parser.add_argument('--save_path',        type=str,   default='models/', help='Where to save models/plots')
+    parser.add_argument('--epochs',           type=int,   default=600)
+    parser.add_argument('--batch_size',       type=int,   default=16)
+    parser.add_argument('--lr',               type=float, default=1e-4)
+    parser.add_argument('--image_size',       type=int,   default=64)
+    parser.add_argument('--T',                type=int,   default=1000)
+    parser.add_argument('--images_per_class', type=int,   default=120)
     args = parser.parse_args()
 
     #  Dataset 
@@ -571,11 +605,17 @@ def main():
     model = UNet(
         in_channels=3,
         out_channels=3,
-        base_channels=64,
+        base_channels=32,
         time_emb_dim=256,
         num_res_blocks=2
     ).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    #  EMA model 
+    ema_model = copy.deepcopy(model)
+    for p in ema_model.parameters():
+        p.requires_grad = False
+    print("EMA model initialised.")
 
     diffusion = DiffusionModel(model, forward_process, device)
 
@@ -583,6 +623,7 @@ def main():
     print("Starting training...")
     losses = train_diffusion_model(
         model=model,
+        ema_model=ema_model,
         diffusion=diffusion,
         train_loader=train_loader,
         epochs=args.epochs,
@@ -592,17 +633,17 @@ def main():
     )
     plot_loss_graph(losses, save_path=args.save_path)
 
-    #  Test
+    #  Test 
     print("Testing model...")
+    # Point diffusion at the EMA model for inference
+    diffusion_ema = DiffusionModel(ema_model, forward_process, device)
     test_model(
         model_path=os.path.join(args.save_path, 'best_model.pth'),
-        diffusion=diffusion,
+        diffusion=diffusion_ema,
         device=device,
-        num_samples=4
+        num_samples=4,
+        save_path=args.save_path
     )
-
-    print("Assignment completed successfully!")
-
 
 if __name__ == "__main__":
     main()
