@@ -2,6 +2,7 @@ import argparse
 import os
 import random
 import warnings
+import copy
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -365,6 +366,10 @@ class DiffusionModel:
                 samples.append(x.clone())
 
         return x, samples
+    
+def update_ema(ema_model, model, decay=0.995):
+    for ema_p, p in zip(ema_model.parameters(), model.parameters()):
+        ema_p.mul_(decay).add_(p, alpha=1 - decay)
 
 
 # Training Function
@@ -568,11 +573,18 @@ def main():
     model = UNet(
         in_channels=3,
         out_channels=3,
-        base_channels=64,
+        base_channels=32,
         time_emb_dim=256,
         num_res_blocks=2
     ).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # After model creation in main():
+    ema_model = copy.deepcopy(model)
+    for p in ema_model.parameters():
+        p.requires_grad_(False)
+    ema_diffusion = DiffusionModel(ema_model, forward_process, device)
+    print("EMA model initialized.")
 
     diffusion = DiffusionModel(model, forward_process, device)
 
